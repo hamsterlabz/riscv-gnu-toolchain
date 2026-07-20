@@ -1,0 +1,346 @@
+RISC-V (gas/opcodes/bfd): xfun fn.* assembler + disassembler support
+
+Adds the `xfun` vendor ISA extension used by the Blackbird combinator
+graph-reduction accelerator. Enable with -march=..._xfun, e.g.
+  riscv32-unknown-elf-as -march=rv32imf_zicsr_xfun foo.S
+
+Instructions:
+  reduction primitives   fn.y  fn.seq  fn.force  fn.box  fn.enter
+  recursion schemes      fn.cata  fn.ana  fn.para  fn.hylo
+  host value movement    fn.tor  fn.update  fn.databox
+  application-tree data  fn.link  fn.elink  fn.combi.t<type>
+
+fn.link/fn.elink/fn.combi emit 32-bit DATA words (low two bits != 0b11),
+so they are not instructions and are handled directly in gas md_assemble
+rather than via the opcode table. The disassembler decodes them back.
+
+Against binutils 2.46. Additions only (no upstream lines removed).
+
+Upstream-Status: Inappropriate [vendor ISA extension for the Blackbird
+fun accelerator]
+
+diff --git a/bfd/elfxx-riscv.c b/bfd/elfxx-riscv.c
+index ee962b4f..62ab0b04 100644
+--- a/bfd/elfxx-riscv.c
++++ b/bfd/elfxx-riscv.c
+@@ -1619,6 +1619,7 @@ static const struct riscv_supported_ext riscv_supported_vendor_x_ext[] =
+   {"xcvmac",		ISA_SPEC_CLASS_DRAFT,   1, 0, 0 },
+   {"xcvmem",		ISA_SPEC_CLASS_DRAFT,	1, 0, 0 },
+   {"xcvsimd",		ISA_SPEC_CLASS_DRAFT,	1, 0, 0 },
++  {"xfun",		ISA_SPEC_CLASS_DRAFT,	1, 0, 0 },
+   {"xtheadba",		ISA_SPEC_CLASS_DRAFT,	1, 0, 0 },
+   {"xtheadbb",		ISA_SPEC_CLASS_DRAFT,	1, 0, 0 },
+   {"xtheadbs",		ISA_SPEC_CLASS_DRAFT,	1, 0, 0 },
+@@ -3012,6 +3013,8 @@ riscv_multi_subset_supports (riscv_parse_subset_t *rps,
+       return riscv_subset_supports (rps, "xcvmem");
+     case INSN_CLASS_XCVSIMD:
+       return riscv_subset_supports (rps, "xcvsimd");
++    case INSN_CLASS_XFUN:
++      return riscv_subset_supports (rps, "xfun");
+     case INSN_CLASS_XTHEADBA:
+       return riscv_subset_supports (rps, "xtheadba");
+     case INSN_CLASS_XTHEADBB:
+@@ -3323,6 +3326,8 @@ riscv_multi_subset_supports_ext (riscv_parse_subset_t *rps,
+       return "xcvmem";
+     case INSN_CLASS_XCVSIMD:
+       return "xcvsimd";
++    case INSN_CLASS_XFUN:
++      return "xfun";
+     case INSN_CLASS_XTHEADBA:
+       return "xtheadba";
+     case INSN_CLASS_XTHEADBB:
+diff --git a/gas/config/tc-riscv.c b/gas/config/tc-riscv.c
+index 6bcf5383..d202dad3 100644
+--- a/gas/config/tc-riscv.c
++++ b/gas/config/tc-riscv.c
+@@ -4394,6 +4394,84 @@ riscv_ip_hardcode (char *str,
+   return NULL;
+ }
+ 
++/* The `fun` extension's ptr/eptr/combi atoms are 32-bit DATA words whose low
++   two bits are not 0b11, so they are not RISC-V instructions and cannot live
++   in the opcode table.  Emit them directly via the data path.  Returns true
++   if STR was one of these directives.  */
++static bool
++riscv_fun_pseudo (char *str)
++{
++  char *p = str;
++  expressionS ex;
++
++  while (*p == ' ' || *p == '\t')
++    p++;
++
++  if (!strncmp (p, "fn.link", 7) && (p[7] == ' ' || p[7] == '\t'))
++    {
++      /* fn.link sym  ->  .word sym   (ptr: 4-byte-aligned address, low2=00) */
++      my_getExpression (&ex, p + 7, false);
++      riscv_mapping_state (MAP_INSN, 0, false);
++      emit_expr (&ex, 4);
++      return true;
++    }
++  if (!strncmp (p, "fn.elink", 8) && (p[8] == ' ' || p[8] == '\t'))
++    {
++      /* fn.elink sym  ->  .word sym+1  (eptr = ptr|1 = address+1, low2=01) */
++      my_getExpression (&ex, p + 8, false);
++      ex.X_add_number += 1;
++      riscv_mapping_state (MAP_INSN, 0, false);
++      emit_expr (&ex, 4);
++      return true;
++    }
++  if (!strncmp (p, "fn.combi.t", 10))
++    {
++      /* fn.combi.t<type> <arity>, [<a0>,<a1>,<a2>,<a3>,<a4>,<a5>]  ->  a .word
++	 with 0x2 | type[10:4] | arity[13:11] | args[31:14] (3 bits each).  */
++      char *q = p + 10;
++      offsetT type, arity, args[6];
++      int i;
++      valueT w;
++
++      type = strtol (q, &q, 10);
++      while (*q == ' ' || *q == '\t') q++;
++      my_getExpression (&ex, q, false);
++      if (ex.X_op != O_constant)
++	{ as_bad (_("fn.combi: arity must be a constant")); return true; }
++      arity = ex.X_add_number;
++      q = expr_parse_end;
++      while (*q == ' ' || *q == '\t') q++;
++      if (*q++ != ',') { as_bad (_("fn.combi: expected `,'")); return true; }
++      while (*q == ' ' || *q == '\t') q++;
++      if (*q++ != '[') { as_bad (_("fn.combi: expected `['")); return true; }
++      for (i = 0; i < 6; i++)
++	{
++	  while (*q == ' ' || *q == '\t') q++;
++	  my_getExpression (&ex, q, false);
++	  if (ex.X_op != O_constant)
++	    { as_bad (_("fn.combi: args must be constants")); return true; }
++	  args[i] = ex.X_add_number;
++	  q = expr_parse_end;
++	  while (*q == ' ' || *q == '\t') q++;
++	  if (i < 5 && *q++ != ',')
++	    { as_bad (_("fn.combi: expected 6 args `[a0,..,a5]'")); return true; }
++	}
++      if (*q != ']') { as_bad (_("fn.combi: expected `]'")); return true; }
++      /* opcode[3:0]=0x2 | type[10:4] (7 bits, T0..T64) | arity[13:11] | args[31:14] */
++      w = 0x2 | ((valueT) (type & 0x7f) << 4) | ((valueT) (arity & 0x7) << 11);
++      for (i = 0; i < 6; i++)
++	w |= (valueT) (args[i] & 0x7) << (14 + 3 * i);
++      ex.X_op = O_constant;
++      ex.X_add_symbol = NULL;
++      ex.X_op_symbol = NULL;
++      ex.X_add_number = w;
++      riscv_mapping_state (MAP_INSN, 0, false);
++      emit_expr (&ex, 4);
++      return true;
++    }
++  return false;
++}
++
+ void
+ md_assemble (char *str)
+ {
+@@ -4401,6 +4479,9 @@ md_assemble (char *str)
+   expressionS imm_expr;
+   bfd_reloc_code_real_type imm_reloc = BFD_RELOC_UNUSED;
+ 
++  if (riscv_fun_pseudo (str))
++    return;
++
+   /* The architecture and privileged elf attributes should be set
+      before assembling.  */
+   if (!start_assemble)
+diff --git a/include/opcode/riscv-opc.h b/include/opcode/riscv-opc.h
+index 6f2775c6..fa177758 100644
+--- a/include/opcode/riscv-opc.h
++++ b/include/opcode/riscv-opc.h
+@@ -4327,7 +4327,68 @@
+ /* Ssqosid CSR addresses.  */
+ #define CSR_SRMCFG 0x181
+ #endif /* RISCV_ENCODING_H */
++/* fun extension (xfun): combinator graph-reduction instructions on the
++   RISC-V custom opcodes (0x0b, 0x5b, 0x7b) plus the low-2-bit-tagged graph
++   data words.  Encodings mirror blackbird-f (rtl/core/fun/reduction_unit.sv,
++   rtl/core/riscv_core.sv host ops, and Model/RvRef.hs).  */
++
++/* Opcode 0x5b (SYSTEM-custom), selected by funct3: the graph reducer's
++   terminators (Y/seq/force/box) plus the host value-movement ops
++   (tor/update/databox).  The terminators read their operands from the
++   reduction spine, so they take no register fields.  */
++#define MATCH_FN_Y	0x0000005b	/* funct3 0: Y (fixpoint knot).  */
++#define MASK_FN_Y	0xffffffff
++#define MATCH_FN_SEQ	0x0000105b	/* funct3 1: seq.  */
++#define MASK_FN_SEQ	0xffffffff
++#define MATCH_FN_TOR	0x0000205b	/* funct3 2: pop spine, rd <- mem[top+4].  */
++#define MASK_FN_TOR	0xfffff07f
++#define MATCH_FN_UPDATE	0x0000305b	/* funct3 3: mem[spine top] <- R[rs2]|1, pop.  */
++#define MASK_FN_UPDATE	0xfe0fffff
++#define MATCH_FN_FORCE	0x0000505b	/* funct3 5: force.  */
++#define MASK_FN_FORCE	0xffffffff
++#define MATCH_FN_BOX	0x0000605b	/* funct3 6: box.  */
++#define MASK_FN_BOX	0xffffffff
++#define MATCH_FN_DATABOX	0x0000705b	/* funct3 7: box R[rs1], rd <- box ptr.  */
++#define MASK_FN_DATABOX	0xfff0707f
++/* Opcode 0x0b: enter -- pop the spine, resume at the popped continuation.  */
++#define MATCH_FN_ENTER	0x0000000b
++#define MASK_FN_ENTER	0xffffffff
++/* Opcode 0x7b: explicit recursion schemes, selected by funct3.  */
++#define MATCH_FN_CATA	0x0000007b	/* funct3 0: catamorphism.  */
++#define MASK_FN_CATA	0xffffffff
++#define MATCH_FN_ANA	0x0000107b	/* funct3 1: anamorphism.  */
++#define MASK_FN_ANA	0xffffffff
++#define MATCH_FN_PARA	0x0000207b	/* funct3 2: paramorphism.  */
++#define MASK_FN_PARA	0xffffffff
++#define MATCH_FN_HYLO	0x0000307b	/* funct3 3: hylomorphism.  */
++#define MASK_FN_HYLO	0xffffffff
++/* Graph data words (not instructions -- their low two bits are never 0b11).
++   fn.link: a pointer cell (low2 00).  fn.elink: an indirection (low2 01).
++   fn.combi: a combinator node (low3 010) with type[10:4], arity[13:11] and
++   up to six 3-bit arg selectors at [14+3k+:3].  */
++#define MATCH_FN_LINK	0x00000000
++#define MASK_FN_LINK	0x00000003
++#define MATCH_FN_ELINK	0x00000001
++#define MASK_FN_ELINK	0x00000003
++#define MATCH_FN_COMBI	0x00000002
++#define MASK_FN_COMBI	0x00000007
++
+ #ifdef DECLARE_INSN
++DECLARE_INSN(fn_y, MATCH_FN_Y, MASK_FN_Y)
++DECLARE_INSN(fn_seq, MATCH_FN_SEQ, MASK_FN_SEQ)
++DECLARE_INSN(fn_tor, MATCH_FN_TOR, MASK_FN_TOR)
++DECLARE_INSN(fn_update, MATCH_FN_UPDATE, MASK_FN_UPDATE)
++DECLARE_INSN(fn_force, MATCH_FN_FORCE, MASK_FN_FORCE)
++DECLARE_INSN(fn_box, MATCH_FN_BOX, MASK_FN_BOX)
++DECLARE_INSN(fn_databox, MATCH_FN_DATABOX, MASK_FN_DATABOX)
++DECLARE_INSN(fn_enter, MATCH_FN_ENTER, MASK_FN_ENTER)
++DECLARE_INSN(fn_cata, MATCH_FN_CATA, MASK_FN_CATA)
++DECLARE_INSN(fn_ana, MATCH_FN_ANA, MASK_FN_ANA)
++DECLARE_INSN(fn_para, MATCH_FN_PARA, MASK_FN_PARA)
++DECLARE_INSN(fn_hylo, MATCH_FN_HYLO, MASK_FN_HYLO)
++DECLARE_INSN(fn_link, MATCH_FN_LINK, MASK_FN_LINK)
++DECLARE_INSN(fn_elink, MATCH_FN_ELINK, MASK_FN_ELINK)
++DECLARE_INSN(fn_combi, MATCH_FN_COMBI, MASK_FN_COMBI)
+ DECLARE_INSN(slli_rv32, MATCH_SLLI_RV32, MASK_SLLI_RV32)
+ DECLARE_INSN(srli_rv32, MATCH_SRLI_RV32, MASK_SRLI_RV32)
+ DECLARE_INSN(srai_rv32, MATCH_SRAI_RV32, MASK_SRAI_RV32)
+diff --git a/include/opcode/riscv.h b/include/opcode/riscv.h
+index de105f5d..05bd15c0 100644
+--- a/include/opcode/riscv.h
++++ b/include/opcode/riscv.h
+@@ -606,6 +606,7 @@ enum riscv_insn_class
+   INSN_CLASS_XMIPSCMOV,
+   INSN_CLASS_XMIPSEXECTL,
+   INSN_CLASS_XMIPSLSP,
++  INSN_CLASS_XFUN,
+ };
+ 
+ /* This structure holds information for a particular instruction.  */
+diff --git a/opcodes/riscv-dis.c b/opcodes/riscv-dis.c
+index 03c8cf1e..669c932e 100644
+--- a/opcodes/riscv-dis.c
++++ b/opcodes/riscv-dis.c
+@@ -1344,6 +1344,58 @@ riscv_data_length (bfd_vma memaddr,
+   return length;
+ }
+ 
++/* Disassemble a `fun` extension DATA word (low two bits != 0b11, so not a
++   RISC-V instruction): ptr -> fn.link, eptr -> fn.elink, combi -> fn.combi,
++   int -> .word.  Always 4 bytes.  */
++
++static int
++riscv_disassemble_fun_data (bfd_vma memaddr ATTRIBUTE_UNUSED,
++			    insn_t insn,
++			    const bfd_byte *packet ATTRIBUTE_UNUSED,
++			    disassemble_info *info)
++{
++  unsigned int w = (unsigned int) insn;
++  void *s = info->stream;
++  info->bytes_per_chunk = 4;
++  info->bytes_per_line = 8;
++  switch (w & 0x3)
++    {
++    case 0x0:	/* ptr */
++      (*info->fprintf_styled_func) (s, dis_style_mnemonic, "fn.link");
++      (*info->fprintf_styled_func) (s, dis_style_text, "\t");
++      (*info->fprintf_styled_func) (s, dis_style_address, "0x%x", w);
++      break;
++    case 0x1:	/* eptr */
++      (*info->fprintf_styled_func) (s, dis_style_mnemonic, "fn.elink");
++      (*info->fprintf_styled_func) (s, dis_style_text, "\t");
++      (*info->fprintf_styled_func) (s, dis_style_address, "0x%x", w & ~3u);
++      break;
++    default:	/* low2 == 0b10 */
++      if ((w & 0x4) == 0)	/* combi:  fn.combi.t<type> <arity>, [a0..a5] */
++	{
++	  (*info->fprintf_styled_func) (s, dis_style_mnemonic, "fn.combi.t%u",
++					(w >> 4) & 0x7f);
++	  (*info->fprintf_styled_func)
++	    (s, dis_style_text, "\t%u, [%u,%u,%u,%u,%u,%u]",
++	     (w >> 11) & 0x7,
++	     (w >> 14) & 0x7, (w >> 17) & 0x7, (w >> 20) & 0x7,
++	     (w >> 23) & 0x7, (w >> 26) & 0x7, (w >> 29) & 0x7);
++	}
++      else			/* int literal */
++	{
++	  int v = (int) ((w >> 3) & 0x1fffffff);
++	  if (v >= 0x10000000)
++	    v -= 0x20000000;
++	  (*info->fprintf_styled_func) (s, dis_style_assembler_directive, ".word");
++	  (*info->fprintf_styled_func) (s, dis_style_text, "\t");
++	  (*info->fprintf_styled_func) (s, dis_style_immediate, "0x%08x", w);
++	  (*info->fprintf_styled_func) (s, dis_style_comment_start, "\t# int %d", v);
++	}
++      break;
++    }
++  return 4;
++}
++
+ /* Dump the data contents.  */
+ 
+ static int
+@@ -1557,6 +1609,16 @@ print_insn_riscv (bfd_vma memaddr, struct disassemble_info *info)
+       insn = (insn_t) bfd_getl16 (packet);
+       dump_size = riscv_insn_length (insn);
+       riscv_disassembler = riscv_disassemble_insn;
++      /* `fun` extension: ptr/eptr/combi/int are 32-bit DATA words (low2 != 0b11
++	 so not real instructions).  Decode them as fun directives.  */
++      if ((insn & 0x3) != 0x3
++	  && riscv_subset_supports
++	       (&((struct riscv_private_data *) info->private_data)->riscv_rps_dis,
++		"xfun"))
++	{
++	  dump_size = 4;
++	  riscv_disassembler = riscv_disassemble_fun_data;
++	}
+     }
+ 
+   bytes_fetched = fetch_insn (memaddr, packet, dump_size, info, &status);
+diff --git a/opcodes/riscv-opc.c b/opcodes/riscv-opc.c
+index 54887c97..bfc7648d 100644
+--- a/opcodes/riscv-opc.c
++++ b/opcodes/riscv-opc.c
+@@ -3580,6 +3580,26 @@ const struct riscv_opcode riscv_opcodes[] =
+ {"mips.swp", 0, INSN_CLASS_XMIPSLSP, "t,r,Xm&(s)", MATCH_MIPS_SWP, MASK_MIPS_SWP, match_opcode, 0 },
+ 
+ /* Terminate the list.  */
++/* fun extension (xfun): combinator graph reduction on the RISC-V custom
++   opcodes.  rtl/core/fun/reduction_unit.sv + Model/RvRef.hs are the
++   reference.  The graph terminators (Y/seq/force/box/enter and the
++   cata/ana/para/hylo recursion schemes) take their operands from the
++   reduction spine, so they carry no register fields; the host
++   value-movement ops carry the usual rd/rs fields.  */
++{"fn.y",      0, INSN_CLASS_XFUN, "",    MATCH_FN_Y,       MASK_FN_Y,       match_opcode, 0 },
++{"fn.seq",    0, INSN_CLASS_XFUN, "",    MATCH_FN_SEQ,     MASK_FN_SEQ,     match_opcode, 0 },
++{"fn.force",  0, INSN_CLASS_XFUN, "",    MATCH_FN_FORCE,   MASK_FN_FORCE,   match_opcode, 0 },
++{"fn.box",    0, INSN_CLASS_XFUN, "",    MATCH_FN_BOX,     MASK_FN_BOX,     match_opcode, 0 },
++{"fn.enter",  0, INSN_CLASS_XFUN, "",    MATCH_FN_ENTER,   MASK_FN_ENTER,   match_opcode, 0 },
++{"fn.cata",   0, INSN_CLASS_XFUN, "",    MATCH_FN_CATA,    MASK_FN_CATA,    match_opcode, 0 },
++{"fn.ana",    0, INSN_CLASS_XFUN, "",    MATCH_FN_ANA,     MASK_FN_ANA,     match_opcode, 0 },
++{"fn.para",   0, INSN_CLASS_XFUN, "",    MATCH_FN_PARA,    MASK_FN_PARA,    match_opcode, 0 },
++{"fn.hylo",   0, INSN_CLASS_XFUN, "",    MATCH_FN_HYLO,    MASK_FN_HYLO,    match_opcode, 0 },
++{"fn.tor",    0, INSN_CLASS_XFUN, "d",   MATCH_FN_TOR,     MASK_FN_TOR,     match_opcode, 0 },
++{"fn.update", 0, INSN_CLASS_XFUN, "t",   MATCH_FN_UPDATE,  MASK_FN_UPDATE,  match_opcode, 0 },
++{"fn.databox",0, INSN_CLASS_XFUN, "d,s", MATCH_FN_DATABOX, MASK_FN_DATABOX, match_opcode, 0 },
++/* fn.link / fn.elink / fn.combi emit DATA words (low2 != 0b11), so they are
++   not instructions -- gas md_assemble (tc-riscv.c) handles them directly.  */
+ {0, 0, INSN_CLASS_NONE, 0, 0, 0, 0, 0}
+ };
+ 
