@@ -1,6 +1,39 @@
 RISC-V GNU Compiler Toolchain
 =============================
 
+> ## Fork note: `xfun` (Blackbird fun ISA) support
+>
+> This fork adds assembler + disassembler support for **`xfun`**, the vendor
+> RISC-V extension used by the Blackbird combinator graph-reduction
+> accelerator. Everything else is stock upstream.
+>
+> The change is carried as a **patch against the `binutils` submodule**, so
+> this stays a thin, rebasable fork:
+>
+> ```bash
+> git clone --recursive https://github.com/hamsterlabz/riscv-gnu-toolchain
+> cd riscv-gnu-toolchain
+> ./apply-xfun.sh                 # patch binutils  (--check dry-runs, --revert undoes)
+> ./configure --prefix=/opt/riscv --with-arch=rv32ima_zicsr --with-abi=ilp32
+> make                            # or: make newlib / make linux
+> ```
+>
+> Then assemble fun code with `-march=..._xfun`:
+>
+> ```bash
+> riscv32-unknown-elf-as -march=rv32imf_zicsr_xfun foo.S -o foo.o
+> riscv32-unknown-elf-objdump -d foo.o        # decodes fn.* back
+> ```
+>
+> Adds `fn.y/seq/force/box/enter` (reduction primitives),
+> `fn.cata/ana/para/hylo` (recursion schemes), `fn.tor/update/databox`
+> (host value movement) and the `fn.link/elink/combi.t` data words.
+>
+> Full details: **[README-xfun.md](README-xfun.md)** ·
+> patch: `patches/0001-riscv-xfun-fn-assembler-support.patch`
+> (binutils 2.46, additions only).
+
+
 This is the RISC-V C and C++ cross-compiler. It supports two build modes:
 a generic ELF/Newlib toolchain and a more sophisticated Linux-ELF/glibc
 toolchain.
